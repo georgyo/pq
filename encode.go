@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/lib/pq/oid"
 	"math"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -74,6 +75,21 @@ func decode(s []byte, typ oid.Oid) interface{} {
 			errorf("%s", err)
 		}
 		return f
+	case oid.T_inet:
+		ip := net.ParseIP(string(s))
+		return ip
+	case oid.T_macaddr:
+		mac, err := net.ParseMAC(string(s))
+		if err != nil {
+			errorf("%s", err)
+		}
+		return mac
+	case oid.T_cidr:
+		_, ipnet, err := net.ParseCIDR(string(s))
+		if err != nil {
+			errorf("%s", err)
+		}
+		return ipnet
 	}
 
 	return s
