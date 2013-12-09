@@ -79,6 +79,25 @@ func TestReconnect(t *testing.T) {
 	}
 }
 
+func TestCommitInFailedTransaction(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := txn.Query("SELECT error")
+	if err == nil {
+		rows.Close()
+		t.Fatal("expected failure")
+	}
+	err = txn.Commit()
+	if err != ErrInFailedTransaction {
+		t.Fatal("expected ErrInFailedTransaction; got %#v", err)
+	}
+}
+
 func TestOpenURL(t *testing.T) {
 	db, err := openTestConnConninfo("postgres://")
 	if err != nil {
@@ -218,6 +237,32 @@ func TestRowsCloseBeforeDone(t *testing.T) {
 
 	if r.Err() != nil {
 		t.Fatal(r.Err())
+	}
+}
+
+func TestParameterCountMismatch(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	var notused int
+	err := db.QueryRow("SELECT false", 1).Scan(&notused)
+	if err == nil {
+		t.Fatal("expected err")
+	}
+	// make sure we clean up correctly
+	err = db.QueryRow("SELECT 1").Scan(&notused)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = db.QueryRow("SELECT $1").Scan(&notused)
+	if err == nil {
+		t.Fatal("expected err")
+	}
+	// make sure we clean up correctly
+	err = db.QueryRow("SELECT 1").Scan(&notused)
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -417,7 +462,7 @@ func TestErrorOnQuery(t *testing.T) {
 	}
 }
 
-func TestErrorOnQueryRow(t *testing.T) {
+func TestErrorOnQueryRowSimpleQuery(t *testing.T) {
 	db := openTestConn(t)
 	defer db.Close()
 
@@ -433,7 +478,31 @@ func TestErrorOnQueryRow(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected Error, got %#v", err)
 	} else if e.Code.Name() != "unique_violation" {
-		t.Fatalf("expected unique_violation, got %s (%+v", e.Code.Name(), err)
+		t.Fatalf("expected unique_violation, got %s (%+v)", e.Code.Name(), err)
+	}
+}
+
+// Test the QueryRow bug workaround in exec
+func TestQueryRowBugWorkaround(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	_, err := db.Exec("CREATE TEMP TABLE notnulltemp (a varchar(10) not null)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var a string
+	err = db.QueryRow("INSERT INTO notnulltemp(a) values($1) RETURNING a", nil).Scan(&a)
+	if err == sql.ErrNoRows {
+		t.Errorf("expected constraint violation error; got: %v", err)
+	}
+	pge, ok := err.(*Error)
+	if !ok {
+		t.Errorf("expected *Error; got: %#v", err)
+	}
+	if pge.Code.Name() != "not_null_violation" {
+		t.Errorf("expected not_null_violation; got: %s (%+v)", pge.Code.Name(), err)
 	}
 }
 
@@ -474,6 +543,22 @@ func TestBindError(t *testing.T) {
 	defer r.Close()
 }
 
+func TestParseErrorInExtendedQuery(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	rows, err := db.Query("PARSE_ERROR $1", 1)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	rows, err = db.Query("SELECT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+}
+
 // TestReturning tests that an INSERT query using the RETURNING clause returns a row.
 func TestReturning(t *testing.T) {
 	db := openTestConn(t)
@@ -510,6 +595,89 @@ func TestReturning(t *testing.T) {
 	}
 }
 
+func TestIssue186(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	// Exec() a query which returns results
+	_, err := db.Exec("VALUES (1), (2), (3)")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = db.Exec("VALUES ($1), ($2), ($3)", 1, 2, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Query() a query which doesn't return any results
+	txn, err := db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer txn.Rollback()
+
+	rows, err := txn.Query("CREATE TEMP TABLE foo(f1 int)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// small trick to get NoData from a parameterized query
+	_, err = txn.Exec("CREATE RULE nodata AS ON INSERT TO foo DO INSTEAD NOTHING")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err = txn.Query("INSERT INTO foo VALUES ($1)", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIssue196(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	row := db.QueryRow("SELECT float4 '0.10000122' = $1, float8 '35.03554004971999' = $2",
+		float32(0.10000122), float64(35.03554004971999))
+
+	var float4match, float8match bool
+	err := row.Scan(&float4match, &float8match)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !float4match {
+		t.Errorf("Expected float4 fidelity to be maintained; got no match")
+	}
+	if !float8match {
+		t.Errorf("Expected float8 fidelity to be maintained; got no match")
+	}
+}
+
+func TestReadFloatPrecision(t *testing.T) {
+	db := openTestConn(t)
+	defer db.Close()
+
+	row := db.QueryRow("SELECT float4 '0.10000122', float8 '35.03554004971999'")
+	var float4val float32
+	var float8val float64
+	err := row.Scan(&float4val, &float8val)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if float4val != float32(0.10000122) {
+		t.Errorf("Expected float4 fidelity to be maintained; got no match")
+	}
+	if float8val != float64(35.03554004971999) {
+		t.Errorf("Expected float8 fidelity to be maintained; got no match")
+	}
+}
+
 var envParseTests = []struct {
 	Expected map[string]string
 	Env      []string
@@ -531,6 +699,44 @@ func TestParseEnviron(t *testing.T) {
 			t.Errorf("%d: Expected: %#v Got: %#v", i, tt.Expected, results)
 		}
 	}
+}
+
+func TestParseComplete(t *testing.T) {
+	tpc := func(commandTag string, command string, affectedRows int64, shouldFail bool) {
+		defer func() {
+			if p := recover(); p != nil {
+				if !shouldFail {
+					t.Error(p)
+				}
+			}
+		}()
+		res, c := parseComplete(commandTag)
+		if c != command {
+			t.Errorf("Expected %v, got %v", command, c)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != affectedRows {
+			t.Errorf("Expected %d, got %d", affectedRows, n)
+		}
+	}
+
+	tpc("ALTER TABLE", "ALTER TABLE", 0, false)
+	tpc("INSERT 0 1", "INSERT", 1, false)
+	tpc("UPDATE 100", "UPDATE", 100, false)
+	tpc("SELECT 100", "SELECT", 100, false)
+	tpc("FETCH 100", "FETCH", 100, false)
+	// allow COPY (and others) without row count
+	tpc("COPY", "COPY", 0, false)
+	// don't fail on command tags we don't recognize
+	tpc("UNKNOWNCOMMANDTAG", "UNKNOWNCOMMANDTAG", 0, false)
+
+	// failure cases
+	tpc("INSERT 1", "", 0, true)   // missing oid
+	tpc("UPDATE 0 1", "", 0, true) // too many numbers
+	tpc("SELECT foo", "", 0, true) // invalid row count
 }
 
 func TestExecerInterface(t *testing.T) {
@@ -614,10 +820,7 @@ FROM (VALUES (0::integer, NULL::text), (1, 'test string')) AS t;`)
 	}
 }
 
-// Open transaction, issue INSERT query inside transaction, rollback
-// transaction, issue SELECT query to same db used to create the tx.  No rows
-// should be returned.
-func TestRollback(t *testing.T) {
+func TestCommit(t *testing.T) {
 	db := openTestConn(t)
 	defer db.Close()
 
@@ -631,21 +834,21 @@ func TestRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = tx.Query(sqlInsert)
+	_, err = tx.Exec(sqlInsert)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = tx.Rollback()
+	err = tx.Commit()
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := db.Query(sqlSelect)
+	var i int
+	err = db.QueryRow(sqlSelect).Scan(&i)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Next() returns false if query returned no rows.
-	if r.Next() {
-		t.Fatal("Transaction rollback failed")
+	if i != 1 {
+		t.Fatalf("expected 1, got %d", i)
 	}
 }
 

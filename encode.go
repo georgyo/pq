@@ -1,6 +1,7 @@
 package pq
 
 import (
+	"bytes"
 	"database/sql/driver"
 	"encoding/hex"
 	"fmt"
@@ -16,8 +17,10 @@ func encode(x interface{}, pgtypOid oid.Oid) []byte {
 	switch v := x.(type) {
 	case int64:
 		return []byte(fmt.Sprintf("%d", v))
-	case float32, float64:
-		return []byte(fmt.Sprintf("%f", v))
+	case float32:
+		return []byte(fmt.Sprintf("%.9f", v))
+	case float64:
+		return []byte(fmt.Sprintf("%.17f", v))
 	case []byte:
 		if pgtypOid == oid.T_bytea {
 			return []byte(fmt.Sprintf("\\x%x", v))
@@ -44,13 +47,7 @@ func encode(x interface{}, pgtypOid oid.Oid) []byte {
 func decode(s []byte, typ oid.Oid) interface{} {
 	switch typ {
 	case oid.T_bytea:
-		s = s[2:] // trim off "\\x"
-		d := make([]byte, hex.DecodedLen(len(s)))
-		_, err := hex.Decode(d, s)
-		if err != nil {
-			errorf("%s", err)
-		}
-		return d
+		return parseBytea(s)
 	case oid.T_timestamptz, oid.T_timestamp, oid.T_date:
 		return parseTs(string(s))
 	case oid.T_time:
@@ -209,6 +206,54 @@ func parseTs(str string) (result time.Time) {
 	return time.Date(bcSign*year, time.Month(month), day,
 		hour, minute, second, nanoSec,
 		time.FixedZone("", tzOff))
+}
+
+// Parse a bytea value received from the server.  Both "hex" and the legacy
+// "escape" format are supported.
+func parseBytea(s []byte) (result []byte) {
+	if len(s) >= 2 && bytes.Equal(s[:2], []byte("\\x")) {
+		// bytea_output = hex
+		s = s[2:] // trim off leading "\\x"
+		result = make([]byte, hex.DecodedLen(len(s)))
+		_, err := hex.Decode(result, s)
+		if err != nil {
+			errorf("%s", err)
+		}
+	} else {
+		// bytea_output = escape
+		for len(s) > 0 {
+			if s[0] == '\\' {
+				// escaped \\
+				if len(s) >= 2 && s[1] == '\\' {
+					result = append(result, '\\')
+					s = s[2:]
+					continue
+				}
+
+				// '\\' followed by an octal number
+				if len(s) < 4 {
+					errorf("invalid bytea sequence %v", s)
+				}
+				r, err := strconv.ParseInt(string(s[1:4]), 8, 9)
+				if err != nil {
+					errorf("could not parse bytea value: %s", err.Error())
+				}
+				result = append(result, byte(r))
+				s = s[4:]
+			} else {
+				// unescaped, raw byte
+				i := bytes.IndexByte(s, '\\')
+				if i == -1 {
+					result = append(result, s...)
+					break
+				}
+				result = append(result, s[:i]...)
+				s = s[i:]
+			}
+		}
+	}
+
+	return result
 }
 
 // NullTime represents a time.Time that may be null. NullTime implements the
